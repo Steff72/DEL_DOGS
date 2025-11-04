@@ -1,0 +1,67 @@
+# ======================================================
+# CODEX Agent – .gitignore
+# Keep the repo clean. Ignore build, cache, and secrets.
+# ======================================================
+
+# --- Python build and cache files ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+env/
+venv/
+ENV/
+
+# --- IDE and editor settings ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Logs and temp files ---
+*.log
+*.tmp
+*.bak
+*.old
+*.DS_Store
+
+# --- Environment files ---
+.env
+.env.*
+!example.env
+
+# --- Jupyter notebooks checkpoints ---
+.ipynb_checkpoints/
+
+# --- Coverage and testing ---
+htmlcov/
+.coverage
+.coverage.*
+.cache/
+pytest_cache/
+
+# --- Type checker and linter cache ---
+.mypy_cache/
+.pyre/
+.pytype/
+ruff_cache/
+
+# --- Project-specific ignores ---
+data/
+codex_rules.md
+
+# --- Documentation build artifacts ---
+site/
+docs/_build/
+
+# --- OS-specific files ---
+Thumbs.db
+.DS_Store
