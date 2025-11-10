@@ -2,20 +2,32 @@
 
 from collections import Counter
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from PIL import Image
 import torch
-from torch.utils.data import Dataset
+from torch import nn
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from directory_tree import DisplayTree
 
 
 def _split_class_folder_name(name: str) -> Tuple[str, str]:
-    """Return the WordNet ID and description extracted from a folder name."""
+    """
+    Return the WordNet ID and description extracted from a folder name.
+
+    Args:
+        name (str): Folder name in the form ``<wnid>-<description>`` or
+            simply ``<wnid>``.
+
+    Returns:
+        tuple[str, str]: ``(wnid, description)`` where ``description`` is an
+        empty string when the folder does not include a suffix.
+    """
     # Some folders are named ``<wnid>-<description>`` while others contain only
     # the WordNet identifier. Split once to keep both parts for display logic.
     if "-" in name:
@@ -56,24 +68,23 @@ def resolve_images_root(
 
 def print_data_folder_structure(root_dir: str, max_depth: int = 1) -> None:
     """
-    Displays the folder and file structure of a given directory.
+    Display the folder and file structure of a given directory.
 
     Args:
-        root_dir (str): The path to the root directory to be displayed.
-        max_depth (int): The maximum depth to traverse the directory tree.
+        root_dir (str): Absolute or relative path to the root directory.
+        max_depth (int): Maximum depth for the directory traversal.
+
+    Returns:
+        None
     """
-    # Define the configuration settings for displaying the directory tree.
+    # Configure the directory tree visualiser.
     config_tree = {
-        # Specify the starting path for the directory tree.
         "dirPath": root_dir,
-        # Set to False to include both files and directories.
         "onlyDirs": False,
-        # Set the maximum depth for the tree traversal.
         "maxDepth": max_depth,
-        # Specify a sorting option (100 typically means no specific sort).
         "sortBy": 100,
     }
-    # Create and display the tree structure using the unpacked configuration.
+    # Render the tree using the external helper.
     DisplayTree(**config_tree)
 
 
@@ -90,21 +101,20 @@ def plot_group_overview_grid(
     Plot a grid that shows the first image of each class directory.
 
     Args:
-        root_dir (str | Path | None): Optional custom image root passed to
-            ``resolve_images_root``. Defaults to the repository dataset.
-        n_rows (int): Number of rows in the grid. Defaults to 20.
-        n_cols (int): Number of columns in the grid. Defaults to 6.
-        figsize (tuple[float, float]): Matplotlib figure size. Defaults to
-            ``(18, 60)``.
-        show (bool): Whether to trigger ``plt.show()`` before returning.
-        return_objects (bool): If True, return the (figure, axes) tuple so
-            callers can further customize the plot.
-        dataset (optional): Dataset object exposing ``class_to_idx`` and
-            ``get_label_description`` so titles can use friendly labels.
+        root_dir (str | Path | None): Optional dataset root. Falls back to the
+            default repository dataset when omitted.
+        n_rows (int): Number of rows in the image grid.
+        n_cols (int): Number of columns in the image grid.
+        figsize (tuple[float, float]): Matplotlib figure size.
+        show (bool): Whether to call ``plt.show()`` before returning.
+        return_objects (bool): When ``True`` the Matplotlib figure and axes are
+            returned for further customization.
+        dataset (Any, optional): Dataset exposing ``class_to_idx`` and
+            ``get_label_description`` so axes titles can use readable labels.
 
     Returns:
-        Optional[tuple[plt.Figure, Any]]: The (figure, axes) tuple when
-            ``return_objects`` is True; otherwise ``None``.
+        Optional[tuple[plt.Figure, Any]]: ``(figure, axes)`` when
+        ``return_objects`` is ``True``; otherwise ``None``.
     """
     image_root = Path(resolve_images_root(root_dir))
     class_dirs = sorted(
@@ -169,7 +179,22 @@ def plot_class_distribution(
     show: bool = True,
     return_objects: bool = False,
 ) -> Optional[Tuple[plt.Figure, Axes]]:
-    """Plot the number of samples available for each label in the dataset."""
+    """
+    Plot the number of samples available for each label in the dataset.
+
+    Args:
+        dataset (Any): Dataset exposing a ``labels`` attribute and optional
+            ``get_label_description`` helper.
+        top_n (int | None): When provided, limit the plot to the ``top_n``
+            most frequent classes.
+        figsize (tuple[float, float]): Matplotlib figure size.
+        show (bool): Whether to display the plot immediately.
+        return_objects (bool): Whether to return the ``(figure, ax)`` pair.
+
+    Returns:
+        Optional[tuple[plt.Figure, Axes]]: Matplotlib figure/axes when
+        ``return_objects`` is ``True``; otherwise ``None``.
+    """
     if not hasattr(dataset, "labels"):
         raise AttributeError("Dataset must expose a 'labels' attribute.")
 
@@ -231,7 +256,18 @@ def get_mean_std(
     dataset: Dataset,
     image_size: Tuple[int, int] = (128, 128),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute per-channel mean and standard deviation for a dataset."""
+    """
+    Compute per-channel mean and standard deviation for a dataset.
+
+    Args:
+        dataset (Dataset): Dataset yielding PIL images.
+        image_size (tuple[int, int]): Size to which images are resized before
+            computing statistics.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: ``(mean, std)`` tensors of shape
+        ``(3,)`` containing RGB channel statistics.
+    """
     preprocess = transforms.Compose(
         [transforms.Resize(image_size), transforms.ToTensor()]
     )
@@ -241,8 +277,11 @@ def get_mean_std(
     pixel_count = 0
 
     for image, _ in dataset:
+        # Apply the same preprocessing pipeline the model will see.
         tensor = preprocess(image)
+        # Keep track of how many pixels contribute to the statistics.
         pixel_count += tensor.size(1) * tensor.size(2)
+        # Accumulate first-order and second-order statistics per channel.
         channel_sums += tensor.sum(dim=(1, 2))
         channel_sums_sq += (tensor ** 2).sum(dim=(1, 2))
 
@@ -251,3 +290,152 @@ def get_mean_std(
     std = torch.sqrt(torch.clamp(variance, min=0.0))
 
     return mean, std
+
+
+def train_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: Optimizer,
+    loss_fcn: nn.Module,
+    device: torch.device,
+) -> Tuple[float, float]:
+    """
+    Train ``model`` for a single epoch.
+
+    Args:
+        model (nn.Module): Model under training.
+        dataloader (DataLoader): Iterable of training batches.
+        optimizer (Optimizer): Optimiser used for parameter updates.
+        loss_fcn (nn.Module): Loss function applied to each batch.
+        device (torch.device): Target device for inputs and model.
+
+    Returns:
+        tuple[float, float]: ``(average_loss, accuracy)`` for the epoch.
+    """
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    samples = 0
+
+    # Iterate over each mini-batch produced by the dataloader.
+    for inputs, targets in dataloader:
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        # Standard training step: forward, loss, backward, optimizer update.
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = loss_fcn(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        predictions = outputs.argmax(dim=1)
+        correct += (predictions == targets).sum().item()
+        samples += targets.size(0)
+
+    avg_loss = running_loss / max(samples, 1)
+    accuracy = correct / max(samples, 1)
+    return avg_loss, accuracy
+
+
+def validate_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    loss_fcn: nn.Module,
+    device: torch.device,
+) -> Tuple[float, float]:
+    """
+    Evaluate ``model`` on ``dataloader`` without updating weights.
+
+    Args:
+        model (nn.Module): Model under evaluation.
+        dataloader (DataLoader): Iterable of validation or test batches.
+        loss_fcn (nn.Module): Loss function applied to each batch.
+        device (torch.device): Target device for inputs and model.
+
+    Returns:
+        tuple[float, float]: ``(average_loss, accuracy)`` for the epoch.
+    """
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    samples = 0
+
+    with torch.no_grad():
+        # The validation loop mirrors the training loop minus gradient steps.
+        for inputs, targets in dataloader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            outputs = model(inputs)
+            loss = loss_fcn(outputs, targets)
+            running_loss += loss.item() * inputs.size(0)
+
+            predictions = outputs.argmax(dim=1)
+            correct += (predictions == targets).sum().item()
+            samples += targets.size(0)
+
+    avg_loss = running_loss / max(samples, 1)
+    accuracy = correct / max(samples, 1)
+    return avg_loss, accuracy
+
+
+def train_model(
+    model: nn.Module,
+    optimizer: Optimizer,
+    train_dataloader: DataLoader,
+    n_epochs: int,
+    loss_fcn: nn.Module,
+    device: torch.device,
+    val_dataloader: Optional[DataLoader] = None,
+    log_hook: Optional[Callable[[dict, int], None]] = None,
+) -> List[dict]:
+    """
+    Train ``model`` for ``n_epochs`` while optionally logging metrics.
+
+    Args:
+        model: The neural network to optimise.
+        optimizer: Optimiser instance (e.g., SGD, Adam).
+        train_dataloader: Batched training data.
+        n_epochs: Number of epochs to run.
+        loss_fcn: Criterion used to compute the loss.
+        device: Target device (CPU, CUDA, or MPS).
+        val_dataloader: Optional validation dataloader.
+        log_hook: Callable that receives (metrics, epoch) for logging.
+
+    Returns:
+        list[dict]: Sequence of metric dictionaries, one per epoch.
+    """
+    history: List[dict] = []
+    for epoch in range(1, n_epochs + 1):
+        train_loss, train_acc = train_epoch(
+            model=model,
+            dataloader=train_dataloader,
+            optimizer=optimizer,
+            loss_fcn=loss_fcn,
+            device=device,
+        )
+
+        metrics = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_accuracy": train_acc,
+        }
+
+        if val_dataloader is not None:
+            val_loss, val_acc = validate_epoch(
+                model=model,
+                dataloader=val_dataloader,
+                loss_fcn=loss_fcn,
+                device=device,
+            )
+            metrics["val_loss"] = val_loss
+            metrics["val_accuracy"] = val_acc
+
+        history.append(metrics)
+        if log_hook is not None:
+            # Let callers stream metrics to their preferred logging backend.
+            log_hook(metrics, epoch)
+
+    return history
