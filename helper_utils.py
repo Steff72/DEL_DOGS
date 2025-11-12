@@ -4,16 +4,26 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
+import os
+import pandas as pd
+import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from PIL import Image
+
 import torch
 from torch import nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from tensorboard.backend.event_processing import event_accumulator
 
 from directory_tree import DisplayTree
+
+
+
+
+
 
 
 def _split_class_folder_name(name: str) -> Tuple[str, str]:
@@ -389,7 +399,7 @@ def train_model(
     loss_fcn: nn.Module,
     device: torch.device,
     val_dataloader: Optional[DataLoader] = None,
-    log_hook: Optional[Callable[[dict, int], None]] = None,
+    writer: Optional[Any] = None,
 ) -> List[dict]:
     """
     Train ``model`` for ``n_epochs`` while optionally logging metrics.
@@ -402,7 +412,7 @@ def train_model(
         loss_fcn: Criterion used to compute the loss.
         device: Target device (CPU, CUDA, or MPS).
         val_dataloader: Optional validation dataloader.
-        log_hook: Callable that receives (metrics, epoch) for logging.
+        writer: Optional TensorBoard ``SummaryWriter`` for scalar logging.
 
     Returns:
         list[dict]: Sequence of metric dictionaries, one per epoch.
@@ -434,8 +444,205 @@ def train_model(
             metrics["val_accuracy"] = val_acc
 
         history.append(metrics)
-        if log_hook is not None:
-            # Let callers stream metrics to their preferred logging backend.
-            log_hook(metrics, epoch)
+
+        if writer is not None:
+            # Mirror the metrics to TensorBoard for quick visualisation.
+            if val_dataloader is not None:
+                writer.add_scalars(
+                    "Loss",
+                    {"train": train_loss, "val": metrics["val_loss"]},
+                    epoch,
+                )
+                writer.add_scalars(
+                    "Accuracy",
+                    {"train": train_acc, "val": metrics["val_accuracy"]},
+                    epoch,
+                )
+            else:
+                writer.add_scalar("Loss/train", train_loss, epoch)
+                writer.add_scalar("Accuracy/train", train_acc, epoch)
 
     return history
+
+
+def plot_learning_curves(run_name: str, log_root: str = "runs"):
+    """
+    Load TensorBoard scalars for a given run and plot learning curves
+    (train/val loss and accuracy) using seaborn with a viridis color palette.
+
+    Args:
+        run_name (str): Name of the run subdirectory under `log_root`
+                        (e.g. "overfit" for logs in "runs/overfit").
+        log_root (str): Root directory where TensorBoard logs are stored.
+    """
+    run_dir = os.path.join(log_root, run_name)
+    if not os.path.isdir(run_dir):
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+
+    # Find every subdirectory that actually contains TensorBoard event files.
+    event_dirs = []
+    for root, _, files in os.walk(run_dir):
+        if any(f.startswith("events.out.tfevents") for f in files):
+            event_dirs.append(root)
+
+    if not event_dirs:
+        raise FileNotFoundError(
+            f"No TensorBoard event files found under: {run_dir}"
+        )
+
+    accumulators = []
+    for event_dir in sorted(event_dirs):
+        ea = event_accumulator.EventAccumulator(event_dir)
+        ea.Reload()
+        accumulators.append((event_dir, ea))
+
+    def infer_metric_and_split(tag: str, event_dir: str):
+        """Infer the metric name and split from the tag/directory context."""
+        tag_lower = tag.lower()
+        dir_lower = event_dir.lower()
+
+        metric = None
+        if "loss" in tag_lower:
+            metric = "loss"
+        elif "acc" in tag_lower:
+            metric = "accuracy"
+        elif "loss" in dir_lower:
+            metric = "loss"
+        elif "acc" in dir_lower:
+            metric = "accuracy"
+
+        split = None
+        if "train" in tag_lower:
+            split = "train"
+        elif "val" in tag_lower:
+            split = "val"
+        elif "valid" in tag_lower:
+            split = "val"
+        elif "train" in dir_lower:
+            split = "train"
+        elif "val" in dir_lower:
+            split = "val"
+        elif "valid" in dir_lower:
+            split = "val"
+
+        return metric, split
+
+    metric_frames = {"loss": [], "accuracy": []}
+
+    for event_dir, ea in accumulators:
+        scalar_tags = ea.Tags().get("scalars", [])
+        for tag in scalar_tags:
+            metric, split = infer_metric_and_split(tag, event_dir)
+            if metric not in metric_frames:
+                continue
+
+            events = ea.Scalars(tag)
+            if not events:
+                continue
+
+            split_label = split if split is not None else "unspecified"
+            frame = pd.DataFrame(
+                {
+                    "epoch": [e.step for e in events],
+                    "value": [e.value for e in events],
+                    "split": [split_label] * len(events),
+                    "metric": [metric] * len(events),
+                }
+            )
+            metric_frames[metric].append(frame)
+
+    def combine_frames(metric: str):
+        if metric_frames[metric]:
+            return pd.concat(metric_frames[metric], ignore_index=True)
+        return pd.DataFrame(columns=["epoch", "value", "split", "metric"])
+
+    loss_df = combine_frames("loss")
+    acc_df = combine_frames("accuracy")
+
+    # Plot with seaborn & viridis
+    sns.set_theme(style="whitegrid")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    def plot_metric(ax: plt.Axes, df: pd.DataFrame, ylabel: str, empty_msg: str):
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        if df.empty:
+            ax.text(
+                0.5,
+                0.5,
+                empty_msg,
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+            return
+
+        hue_levels = sorted(df["split"].unique())
+        palette = sns.color_palette("viridis", max(2, len(hue_levels)))
+        sns.lineplot(
+            data=df,
+            x="epoch",
+            y="value",
+            hue="split",
+            hue_order=hue_levels,
+            ax=ax,
+            palette=palette,
+            errorbar=None
+        )
+        ax.legend(title="Split")
+
+    axes[0].set_title(f"{run_name} – Loss")
+    plot_metric(axes[0], loss_df, "Loss", "No loss scalars found")
+
+    axes[1].set_title(f"{run_name} – Accuracy")
+    plot_metric(axes[1], acc_df, "Accuracy", "No accuracy scalars found")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def build_grid_frame(runs):
+    rows = []
+    for combo in runs:
+        label = combo["label"]
+        for epoch_metrics in combo["history"]:
+            epoch = epoch_metrics["epoch"]
+            rows.append(
+                {
+                    "combo": label,
+                    "epoch": epoch,
+                    "split": "train",
+                    "metric": "loss",
+                    "value": epoch_metrics["train_loss"],
+                }
+            )
+            rows.append(
+                {
+                    "combo": label,
+                    "epoch": epoch,
+                    "split": "train",
+                    "metric": "accuracy",
+                    "value": epoch_metrics["train_accuracy"],
+                }
+            )
+            if "val_loss" in epoch_metrics:
+                rows.append(
+                    {
+                        "combo": label,
+                        "epoch": epoch,
+                        "split": "val",
+                        "metric": "loss",
+                        "value": epoch_metrics["val_loss"],
+                    }
+                )
+            if "val_accuracy" in epoch_metrics:
+                rows.append(
+                    {
+                        "combo": label,
+                        "epoch": epoch,
+                        "split": "val",
+                        "metric": "accuracy",
+                        "value": epoch_metrics["val_accuracy"],
+                    }
+                )
+    return pd.DataFrame(rows)
