@@ -380,21 +380,22 @@ class SubsetWithTransform(Dataset):
 
 
 
-def plot_learning_curves(run_name: str, log_root: str = "runs"):
+def load_run_scalars(run_name: str, log_root: str = "runs") -> pd.DataFrame:
     """
-    Load TensorBoard scalars for a given run and plot learning curves
-    (train/val loss and accuracy) using seaborn with a viridis color palette.
+    Read the latest scalar events for a given TensorBoard run.
 
     Args:
-        run_name (str): Name of the run subdirectory under `log_root`
-                        (e.g. "overfit" for logs in "runs/overfit").
-        log_root (str): Root directory where TensorBoard logs are stored.
+        run_name (str): Run directory relative to ``log_root``.
+        log_root (str): Root directory that contains TensorBoard runs.
+
+    Returns:
+        pandas.DataFrame: Columns ``run``, ``epoch``, ``value``, ``split``,
+        and ``metric`` capturing every scalar time series.
     """
     run_dir = os.path.join(log_root, run_name)
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
-    # Track the most recent event file inside every subdirectory.
     event_files = []
     for root, _, files in os.walk(run_dir):
         candidates = [
@@ -404,22 +405,14 @@ def plot_learning_curves(run_name: str, log_root: str = "runs"):
         ]
         if not candidates:
             continue
-        latest_file = max(candidates, key=os.path.getmtime)
-        event_files.append(latest_file)
+        event_files.append(max(candidates, key=os.path.getmtime))
 
     if not event_files:
         raise FileNotFoundError(
             f"No TensorBoard event files found under: {run_dir}"
         )
 
-    accumulators = []
-    for event_path in sorted(event_files):
-        ea = event_accumulator.EventAccumulator(event_path)
-        ea.Reload()
-        accumulators.append((os.path.dirname(event_path), ea))
-
     def infer_metric_and_split(tag: str, event_dir: str):
-        """Infer the metric name and split from the tag/directory context."""
         tag_lower = tag.lower()
         dir_lower = event_dir.lower()
 
@@ -436,50 +429,57 @@ def plot_learning_curves(run_name: str, log_root: str = "runs"):
         split = None
         if "train" in tag_lower:
             split = "train"
-        elif "val" in tag_lower:
-            split = "val"
-        elif "valid" in tag_lower:
+        elif "val" in tag_lower or "valid" in tag_lower:
             split = "val"
         elif "train" in dir_lower:
             split = "train"
-        elif "val" in dir_lower:
-            split = "val"
-        elif "valid" in dir_lower:
+        elif "val" in dir_lower or "valid" in dir_lower:
             split = "val"
 
         return metric, split
 
-    metric_frames = {"loss": [], "accuracy": []}
-
-    for event_dir, ea in accumulators:
+    records = []
+    for event_path in sorted(event_files):
+        event_dir = os.path.dirname(event_path)
+        ea = event_accumulator.EventAccumulator(event_path)
+        ea.Reload()
         scalar_tags = ea.Tags().get("scalars", [])
         for tag in scalar_tags:
             metric, split = infer_metric_and_split(tag, event_dir)
-            if metric not in metric_frames:
+            if metric is None:
                 continue
-
             events = ea.Scalars(tag)
             if not events:
                 continue
-
             split_label = split if split is not None else "unspecified"
-            frame = pd.DataFrame(
-                {
-                    "epoch": [e.step for e in events],
-                    "value": [e.value for e in events],
-                    "split": [split_label] * len(events),
-                    "metric": [metric] * len(events),
-                }
-            )
-            metric_frames[metric].append(frame)
+            for event in events:
+                records.append(
+                    {
+                        "run": run_name,
+                        "epoch": event.step,
+                        "value": event.value,
+                        "split": split_label,
+                        "metric": metric,
+                    }
+                )
 
-    def combine_frames(metric: str):
-        if metric_frames[metric]:
-            return pd.concat(metric_frames[metric], ignore_index=True)
-        return pd.DataFrame(columns=["epoch", "value", "split", "metric"])
+    return pd.DataFrame(records, columns=["run", "epoch", "value", "split", "metric"])
 
-    loss_df = combine_frames("loss")
-    acc_df = combine_frames("accuracy")
+
+def plot_learning_curves(run_name: str, log_root: str = "runs"):
+    """
+    Load TensorBoard scalars for a given run and plot learning curves.
+    """
+    run_df = load_run_scalars(run_name, log_root=log_root)
+
+    def select_metric(df: pd.DataFrame, metric: str) -> pd.DataFrame:
+        subset = df[df["metric"] == metric]
+        if subset.empty:
+            return pd.DataFrame(columns=df.columns)
+        return subset.copy()
+
+    loss_df = select_metric(run_df, "loss")
+    acc_df = select_metric(run_df, "accuracy")
 
     # Plot with seaborn & viridis
     sns.set_theme(style="whitegrid")
