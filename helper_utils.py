@@ -394,22 +394,29 @@ def plot_learning_curves(run_name: str, log_root: str = "runs"):
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
-    # Find every subdirectory that actually contains TensorBoard event files.
-    event_dirs = []
+    # Track the most recent event file inside every subdirectory.
+    event_files = []
     for root, _, files in os.walk(run_dir):
-        if any(f.startswith("events.out.tfevents") for f in files):
-            event_dirs.append(root)
+        candidates = [
+            os.path.join(root, f)
+            for f in files
+            if f.startswith("events.out.tfevents")
+        ]
+        if not candidates:
+            continue
+        latest_file = max(candidates, key=os.path.getmtime)
+        event_files.append(latest_file)
 
-    if not event_dirs:
+    if not event_files:
         raise FileNotFoundError(
             f"No TensorBoard event files found under: {run_dir}"
         )
 
     accumulators = []
-    for event_dir in sorted(event_dirs):
-        ea = event_accumulator.EventAccumulator(event_dir)
+    for event_path in sorted(event_files):
+        ea = event_accumulator.EventAccumulator(event_path)
         ea.Reload()
-        accumulators.append((event_dir, ea))
+        accumulators.append((os.path.dirname(event_path), ea))
 
     def infer_metric_and_split(tag: str, event_dir: str):
         """Infer the metric name and split from the tag/directory context."""
