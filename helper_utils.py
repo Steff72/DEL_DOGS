@@ -2,7 +2,7 @@
 
 from collections import Counter
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import os
 import pandas as pd
@@ -12,9 +12,7 @@ from matplotlib.axes import Axes
 from PIL import Image
 
 import torch
-from torch import nn
-from torch.optim import Optimizer
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, Subset
 from torchvision import transforms
 from tensorboard.backend.event_processing import event_accumulator
 
@@ -262,6 +260,73 @@ def plot_class_distribution(
     return None
 
 
+
+
+class DogDataset(Dataset):
+    """Dataset wrapper for the Stanford Dogs folder structure."""
+
+    def __init__(self, root_dir: Optional[Union[str, Path]] = None, transform=None):
+        self.transform = transform
+        self.root_dir = resolve_images_root(root_dir)
+        self.image_dir = self.root_dir
+        self.labels = self._load_and_correct_labels()
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int):
+        image = self._retrieve_image(idx)
+        if self.transform is not None:
+            image = self.transform(image)
+        label = self.labels[idx]
+        return image, label
+
+    def value_counts(self) -> Counter:
+        return Counter(self.labels)
+
+    def get_label_description(self, label: int) -> str:
+        raw_name = self.idx_to_class[label]
+        if '-' in raw_name:
+            raw_name = raw_name.split('-', 1)[1]
+        return raw_name.lower()
+
+    def _retrieve_image(self, idx: int) -> Image.Image:
+        img_path = self.image_paths[idx]
+        with Image.open(img_path) as img:
+            image = img.convert('RGB')
+        return image
+
+    def _load_and_correct_labels(self) -> List[int]:
+        class_dirs = [
+            entry
+            for entry in os.listdir(self.image_dir)
+            if os.path.isdir(os.path.join(self.image_dir, entry))
+        ]
+        if not class_dirs:
+            raise ValueError(f"No class folders found in {self.image_dir}.")
+
+        class_dirs.sort()
+        self.class_names = class_dirs
+        self.class_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
+        self.idx_to_class = {idx: name for name, idx in self.class_to_idx.items()}
+
+        image_paths = []
+        labels = []
+        valid_extensions = ('.jpg', '.jpeg', '.png')
+
+        for class_name in self.class_names:
+            class_path = os.path.join(self.image_dir, class_name)
+            for file_name in sorted(os.listdir(class_path)):
+                if file_name.lower().endswith(valid_extensions):
+                    image_paths.append(os.path.join(class_path, file_name))
+                    labels.append(self.class_to_idx[class_name])
+
+        if not image_paths:
+            raise ValueError(f"No image files found under {self.image_dir}.")
+
+        self.image_paths = image_paths
+        return labels
+
 def get_mean_std(
     dataset: Dataset,
     image_size: Tuple[int, int] = (128, 128),
@@ -302,167 +367,17 @@ def get_mean_std(
     return mean, std
 
 
-def train_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
-    optimizer: Optimizer,
-    loss_fcn: nn.Module,
-    device: torch.device,
-) -> Tuple[float, float]:
-    """
-    Train ``model`` for a single epoch.
+class SubsetWithTransform(Dataset):
+    """A subset wrapper that lets you apply a specific transform per split."""
+    def __init__(self, subset: Subset, transform=None):
+        self.subset = subset
+        self.transform = transform
+    def __len__(self):
+        return len(self.subset)
+    def __getitem__(self, idx):
+        image, label = self.subset[idx]
+        return (self.transform(image) if self.transform else image), label
 
-    Args:
-        model (nn.Module): Model under training.
-        dataloader (DataLoader): Iterable of training batches.
-        optimizer (Optimizer): Optimiser used for parameter updates.
-        loss_fcn (nn.Module): Loss function applied to each batch.
-        device (torch.device): Target device for inputs and model.
-
-    Returns:
-        tuple[float, float]: ``(average_loss, accuracy)`` for the epoch.
-    """
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    samples = 0
-
-    # Iterate over each mini-batch produced by the dataloader.
-    for inputs, targets in dataloader:
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-
-        # Standard training step: forward, loss, backward, optimizer update.
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = loss_fcn(outputs, targets)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item() * inputs.size(0)
-        predictions = outputs.argmax(dim=1)
-        correct += (predictions == targets).sum().item()
-        samples += targets.size(0)
-
-    avg_loss = running_loss / max(samples, 1)
-    accuracy = correct / max(samples, 1)
-    return avg_loss, accuracy
-
-
-def validate_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
-    loss_fcn: nn.Module,
-    device: torch.device,
-) -> Tuple[float, float]:
-    """
-    Evaluate ``model`` on ``dataloader`` without updating weights.
-
-    Args:
-        model (nn.Module): Model under evaluation.
-        dataloader (DataLoader): Iterable of validation or test batches.
-        loss_fcn (nn.Module): Loss function applied to each batch.
-        device (torch.device): Target device for inputs and model.
-
-    Returns:
-        tuple[float, float]: ``(average_loss, accuracy)`` for the epoch.
-    """
-    model.eval()
-    running_loss = 0.0
-    correct = 0
-    samples = 0
-
-    with torch.no_grad():
-        # The validation loop mirrors the training loop minus gradient steps.
-        for inputs, targets in dataloader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-
-            outputs = model(inputs)
-            loss = loss_fcn(outputs, targets)
-            running_loss += loss.item() * inputs.size(0)
-
-            predictions = outputs.argmax(dim=1)
-            correct += (predictions == targets).sum().item()
-            samples += targets.size(0)
-
-    avg_loss = running_loss / max(samples, 1)
-    accuracy = correct / max(samples, 1)
-    return avg_loss, accuracy
-
-
-def train_model(
-    model: nn.Module,
-    optimizer: Optimizer,
-    train_dataloader: DataLoader,
-    n_epochs: int,
-    loss_fcn: nn.Module,
-    device: torch.device,
-    val_dataloader: Optional[DataLoader] = None,
-    writer: Optional[Any] = None,
-) -> List[dict]:
-    """
-    Train ``model`` for ``n_epochs`` while optionally logging metrics.
-
-    Args:
-        model: The neural network to optimise.
-        optimizer: Optimiser instance (e.g., SGD, Adam).
-        train_dataloader: Batched training data.
-        n_epochs: Number of epochs to run.
-        loss_fcn: Criterion used to compute the loss.
-        device: Target device (CPU, CUDA, or MPS).
-        val_dataloader: Optional validation dataloader.
-        writer: Optional TensorBoard ``SummaryWriter`` for scalar logging.
-
-    Returns:
-        list[dict]: Sequence of metric dictionaries, one per epoch.
-    """
-    history: List[dict] = []
-    for epoch in range(1, n_epochs + 1):
-        train_loss, train_acc = train_epoch(
-            model=model,
-            dataloader=train_dataloader,
-            optimizer=optimizer,
-            loss_fcn=loss_fcn,
-            device=device,
-        )
-
-        metrics = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "train_accuracy": train_acc,
-        }
-
-        if val_dataloader is not None:
-            val_loss, val_acc = validate_epoch(
-                model=model,
-                dataloader=val_dataloader,
-                loss_fcn=loss_fcn,
-                device=device,
-            )
-            metrics["val_loss"] = val_loss
-            metrics["val_accuracy"] = val_acc
-
-        history.append(metrics)
-
-        if writer is not None:
-            # Mirror the metrics to TensorBoard for quick visualisation.
-            if val_dataloader is not None:
-                writer.add_scalars(
-                    "Loss",
-                    {"train": train_loss, "val": metrics["val_loss"]},
-                    epoch,
-                )
-                writer.add_scalars(
-                    "Accuracy",
-                    {"train": train_acc, "val": metrics["val_accuracy"]},
-                    epoch,
-                )
-            else:
-                writer.add_scalar("Loss/train", train_loss, epoch)
-                writer.add_scalar("Accuracy/train", train_acc, epoch)
-
-    return history
 
 
 def plot_learning_curves(run_name: str, log_root: str = "runs"):

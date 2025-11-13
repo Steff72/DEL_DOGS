@@ -64,6 +64,7 @@ pyzmq==27.1.0
 requests==2.32.5
 scipy==1.13.1
 seaborn==0.13.2
+scikit-learn==1.6.1
 sentry-sdk==2.43.0
 six==1.17.0
 smmap==5.0.2
