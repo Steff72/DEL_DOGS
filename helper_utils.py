@@ -372,6 +372,7 @@ class SubsetWithTransform(Dataset):
     def __init__(self, subset: Subset, transform=None):
         self.subset = subset
         self.transform = transform
+        self.dataset = subset.dataset 
     def __len__(self):
         return len(self.subset)
     def __getitem__(self, idx):
