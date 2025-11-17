@@ -19,11 +19,6 @@ from tensorboard.backend.event_processing import event_accumulator
 from directory_tree import DisplayTree
 
 
-
-
-
-
-
 def _split_class_folder_name(name: str) -> Tuple[str, str]:
     """
     Return the WordNet ID and description extracted from a folder name.
@@ -74,6 +69,7 @@ def resolve_images_root(
 
     return str(base_path)
 
+
 def print_data_folder_structure(root_dir: str, max_depth: int = 1) -> None:
     """
     Display the folder and file structure of a given directory.
@@ -85,7 +81,7 @@ def print_data_folder_structure(root_dir: str, max_depth: int = 1) -> None:
     Returns:
         None
     """
-    # Configure the directory tree visualiser.
+    # Configure the directory tree visualiser so output stays consistent regardless of caller.
     config_tree = {
         "dirPath": root_dir,
         "onlyDirs": False,
@@ -124,14 +120,14 @@ def plot_group_overview_grid(
         Optional[tuple[plt.Figure, Any]]: ``(figure, axes)`` when
         ``return_objects`` is ``True``; otherwise ``None``.
     """
+    # Resolve once so both image discovery and captions share the same base path.
     image_root = Path(resolve_images_root(root_dir))
-    class_dirs = sorted(
-        item for item in image_root.iterdir() if item.is_dir()
-    )
+    class_dirs = sorted(item for item in image_root.iterdir() if item.is_dir())
 
     if not class_dirs:
         raise ValueError(f"No class folders found under {image_root}")
 
+    # Clamp the number of folders to the grid capacity so matplotlib does not crash.
     total_slots = n_rows * n_cols
     selected_dirs = class_dirs[:total_slots]
 
@@ -139,13 +135,14 @@ def plot_group_overview_grid(
     axes_flat = axes_grid.flatten()
 
     for ax, class_dir in zip(axes_flat, selected_dirs):
-        image_files = sorted(
-            item for item in class_dir.iterdir() if item.is_file()
-        )
+        # Each folder can contain many images; pick the first one to represent
+        # the class so the grid renders quickly.
+        image_files = sorted(item for item in class_dir.iterdir() if item.is_file())
         if not image_files:
             ax.axis("off")
             continue
 
+        # Keep sampling deterministic to avoid re-rendering already-known breeds.
         image_path = image_files[0]
         with Image.open(image_path) as image:
             ax.imshow(image.copy())
@@ -214,9 +211,8 @@ def plot_class_distribution(
     if not counts:
         raise ValueError("Dataset does not contain any samples.")
 
-    sorted_items = sorted(
-        counts.items(), key=lambda item: item[1], reverse=True
-    )
+    # Sorting helps emphasize the most frequent breeds when ``top_n`` is set.
+    sorted_items = sorted(counts.items(), key=lambda item: item[1], reverse=True)
     if top_n is not None:
         sorted_items = sorted_items[:top_n]
 
@@ -260,8 +256,6 @@ def plot_class_distribution(
     return None
 
 
-
-
 class DogDataset(Dataset):
     """Dataset wrapper for the Stanford Dogs folder structure."""
 
@@ -269,6 +263,7 @@ class DogDataset(Dataset):
         self.transform = transform
         self.root_dir = resolve_images_root(root_dir)
         self.image_dir = self.root_dir
+        # Labels are derived from folder names once so subsequent indexing stays cheap.
         self.labels = self._load_and_correct_labels()
 
     def __len__(self) -> int:
@@ -286,14 +281,15 @@ class DogDataset(Dataset):
 
     def get_label_description(self, label: int) -> str:
         raw_name = self.idx_to_class[label]
-        if '-' in raw_name:
-            raw_name = raw_name.split('-', 1)[1]
+        if "-" in raw_name:
+            raw_name = raw_name.split("-", 1)[1]
         return raw_name.lower()
 
     def _retrieve_image(self, idx: int) -> Image.Image:
         img_path = self.image_paths[idx]
         with Image.open(img_path) as img:
-            image = img.convert('RGB')
+            # Convert every asset to RGB to avoid downstream mode mismatches.
+            image = img.convert("RGB")
         return image
 
     def _load_and_correct_labels(self) -> List[int]:
@@ -312,10 +308,12 @@ class DogDataset(Dataset):
 
         image_paths = []
         labels = []
-        valid_extensions = ('.jpg', '.jpeg', '.png')
+        # Restrict to common RGB formats; anything else risks pillow decode errors at train time.
+        valid_extensions = (".jpg", ".jpeg", ".png")
 
         for class_name in self.class_names:
             class_path = os.path.join(self.image_dir, class_name)
+            # Iterate deterministically so experiments stay reproducible.
             for file_name in sorted(os.listdir(class_path)):
                 if file_name.lower().endswith(valid_extensions):
                     image_paths.append(os.path.join(class_path, file_name))
@@ -326,6 +324,7 @@ class DogDataset(Dataset):
 
         self.image_paths = image_paths
         return labels
+
 
 def get_mean_std(
     dataset: Dataset,
@@ -347,6 +346,7 @@ def get_mean_std(
         [transforms.Resize(image_size), transforms.ToTensor()]
     )
 
+    # Running accumulators keep memory usage constant regardless of dataset size.
     channel_sums = torch.zeros(3)
     channel_sums_sq = torch.zeros(3)
     pixel_count = 0
@@ -358,10 +358,11 @@ def get_mean_std(
         pixel_count += tensor.size(1) * tensor.size(2)
         # Accumulate first-order and second-order statistics per channel.
         channel_sums += tensor.sum(dim=(1, 2))
-        channel_sums_sq += (tensor ** 2).sum(dim=(1, 2))
+        channel_sums_sq += (tensor**2).sum(dim=(1, 2))
 
+    # Convert running statistics into mean/std; clamp protects against tiny negative variance.
     mean = channel_sums / pixel_count
-    variance = channel_sums_sq / pixel_count - mean ** 2
+    variance = channel_sums_sq / pixel_count - mean**2
     std = torch.sqrt(torch.clamp(variance, min=0.0))
 
     return mean, std
@@ -369,16 +370,18 @@ def get_mean_std(
 
 class SubsetWithTransform(Dataset):
     """A subset wrapper that lets you apply a specific transform per split."""
+
     def __init__(self, subset: Subset, transform=None):
         self.subset = subset
         self.transform = transform
-        self.dataset = subset.dataset 
+        self.dataset = subset.dataset
+
     def __len__(self):
         return len(self.subset)
+
     def __getitem__(self, idx):
         image, label = self.subset[idx]
         return (self.transform(image) if self.transform else image), label
-
 
 
 def load_run_scalars(run_name: str, log_root: str = "runs") -> pd.DataFrame:
@@ -400,20 +403,18 @@ def load_run_scalars(run_name: str, log_root: str = "runs") -> pd.DataFrame:
     event_files = []
     for root, _, files in os.walk(run_dir):
         candidates = [
-            os.path.join(root, f)
-            for f in files
-            if f.startswith("events.out.tfevents")
+            os.path.join(root, f) for f in files if f.startswith("events.out.tfevents")
         ]
         if not candidates:
             continue
+        # Keep the freshest file per directory; stale ones usually contain duplicates.
         event_files.append(max(candidates, key=os.path.getmtime))
 
     if not event_files:
-        raise FileNotFoundError(
-            f"No TensorBoard event files found under: {run_dir}"
-        )
+        raise FileNotFoundError(f"No TensorBoard event files found under: {run_dir}")
 
     def infer_metric_and_split(tag: str, event_dir: str):
+        # TensorBoard tag naming is inconsistent, so derive the metadata via heuristics.
         tag_lower = tag.lower()
         dir_lower = event_dir.lower()
 
@@ -440,6 +441,7 @@ def load_run_scalars(run_name: str, log_root: str = "runs") -> pd.DataFrame:
         return metric, split
 
     records = []
+    # Iterate chronologically so metrics remain in the same order as TensorBoard displays.
     for event_path in sorted(event_files):
         event_dir = os.path.dirname(event_path)
         ea = event_accumulator.EventAccumulator(event_path)
@@ -474,6 +476,7 @@ def plot_learning_curves(run_name: str, log_root: str = "runs"):
     run_df = load_run_scalars(run_name, log_root=log_root)
 
     def select_metric(df: pd.DataFrame, metric: str) -> pd.DataFrame:
+        # Filtering once keeps the plotting helpers simple.
         subset = df[df["metric"] == metric]
         if subset.empty:
             return pd.DataFrame(columns=df.columns)
@@ -510,7 +513,7 @@ def plot_learning_curves(run_name: str, log_root: str = "runs"):
             hue_order=hue_levels,
             ax=ax,
             palette=palette,
-            errorbar=None
+            errorbar=None,
         )
         ax.legend(title="Split")
 
@@ -526,6 +529,7 @@ def plot_learning_curves(run_name: str, log_root: str = "runs"):
 
 def build_grid_frame(runs):
     rows = []
+    # Flatten each training history into a tidy table TensorBoard-style.
     for combo in runs:
         label = combo["label"]
         for epoch_metrics in combo["history"]:
@@ -570,7 +574,9 @@ def build_grid_frame(runs):
                 )
     return pd.DataFrame(rows)
 
+
 # Best-epoch helpers
+
 
 def best_epoch(history, metric="val_accuracy"):
     """
@@ -579,6 +585,7 @@ def best_epoch(history, metric="val_accuracy"):
     """
     key = metric if history and metric in history[0] else "train_accuracy"
     return max(history, key=lambda m: m.get(key, float("-inf")))
+
 
 def report_best(name, history, metric="val_accuracy"):
     """
@@ -594,6 +601,7 @@ def report_best(name, history, metric="val_accuracy"):
     )
     return b
 
+
 def summarize_runs(named_histories, metric="val_accuracy"):
     """
     named_histories: list of (name, history)
@@ -602,15 +610,18 @@ def summarize_runs(named_histories, metric="val_accuracy"):
     rows = []
     for name, hist in named_histories:
         b = best_epoch(hist, metric)
-        rows.append((
-            name,
-            b["epoch"],
-            b.get("val_accuracy", float("nan")),
-            b.get("train_accuracy", float("nan")),
-            b.get("val_loss", float("nan")),
-            b.get("train_loss", float("nan")),
-        ))
+        rows.append(
+            (
+                name,
+                b["epoch"],
+                b.get("val_accuracy", float("nan")),
+                b.get("train_accuracy", float("nan")),
+                b.get("val_loss", float("nan")),
+                b.get("train_loss", float("nan")),
+            )
+        )
     # sort by val_accuracy desc
+    # Keep NaN values at the tail while still sorting descending by val_acc.
     rows.sort(key=lambda r: (r[2] if r[2] == r[2] else -1), reverse=True)  # handle NaN
 
     print("\n=== Best-epoch summary (sorted by val_acc) ===")
@@ -621,4 +632,3 @@ def summarize_runs(named_histories, metric="val_accuracy"):
             f"val_loss {vloss:8.4f} | train_loss {tloss:8.4f}"
         )
     return rows
-
