@@ -569,3 +569,56 @@ def build_grid_frame(runs):
                     }
                 )
     return pd.DataFrame(rows)
+
+# Best-epoch helpers
+
+def best_epoch(history, metric="val_accuracy"):
+    """
+    Return the metrics dict of the best epoch according to `metric`.
+    Falls back to `train_accuracy` if val metric is missing.
+    """
+    key = metric if history and metric in history[0] else "train_accuracy"
+    return max(history, key=lambda m: m.get(key, float("-inf")))
+
+def report_best(name, history, metric="val_accuracy"):
+    """
+    Print a one-liner summary for the best epoch.
+    """
+    b = best_epoch(history, metric)
+    print(
+        f"{name}: best@epoch {b['epoch']} | "
+        f"val_acc={b.get('val_accuracy', float('nan')):.3%} | "
+        f"train_acc={b.get('train_accuracy', float('nan')):.3%} | "
+        f"val_loss={b.get('val_loss', float('nan')):.4f} | "
+        f"train_loss={b.get('train_loss', float('nan')):.4f}"
+    )
+    return b
+
+def summarize_runs(named_histories, metric="val_accuracy"):
+    """
+    named_histories: list of (name, history)
+    Prints best-epoch lines sorted by the chosen metric.
+    """
+    rows = []
+    for name, hist in named_histories:
+        b = best_epoch(hist, metric)
+        rows.append((
+            name,
+            b["epoch"],
+            b.get("val_accuracy", float("nan")),
+            b.get("train_accuracy", float("nan")),
+            b.get("val_loss", float("nan")),
+            b.get("train_loss", float("nan")),
+        ))
+    # sort by val_accuracy desc
+    rows.sort(key=lambda r: (r[2] if r[2] == r[2] else -1), reverse=True)  # handle NaN
+
+    print("\n=== Best-epoch summary (sorted by val_acc) ===")
+    for name, ep, vacc, tacc, vloss, tloss in rows:
+        print(
+            f"{name:40s} | epoch {ep:3d} | "
+            f"val_acc {vacc:7.3%} | train_acc {tacc:7.3%} | "
+            f"val_loss {vloss:8.4f} | train_loss {tloss:8.4f}"
+        )
+    return rows
+
