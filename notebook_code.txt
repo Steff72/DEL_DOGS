@@ -1,0 +1,1527 @@
+Cell 1:
+import os, shutil, time, math, importlib, json
+from contextlib import nullcontext
+from itertools import product
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+from sklearn.model_selection import KFold
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from PIL import Image
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.tensorboard import SummaryWriter 
+from torchvision import transforms
+
+import helper_utils
+
+importlib.reload(helper_utils)
+
+----------------------------------------
+Cell 2:
+# Prefer CUDA, then Apple Metal (MPS), falling back to CPU.
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
+print('Using device:', device)
+----------------------------------------
+Cell 4:
+# Define the path to the root directory of the dataset.
+path_dataset = 'data/raw/Images'
+
+# Display the folder structure of the dataset directory up to a depth of one.
+helper_utils.print_data_folder_structure(path_dataset, max_depth=1)
+----------------------------------------
+Cell 5:
+# Dataset utilities are imported from helper_utils so multiprocessing workers can import them.
+from helper_utils import DogDataset, SubsetWithTransform
+
+----------------------------------------
+Cell 6:
+# Initialize the dataset object, show the number of samples
+dog_dataset = DogDataset()
+num_samples = len(dog_dataset)
+print(f"Number of samples in dataset: {num_samples}")
+
+----------------------------------------
+Cell 8:
+# Plot overview
+helper_utils.plot_group_overview_grid()
+----------------------------------------
+Cell 9:
+# Visualize sample counts per breed
+helper_utils.plot_class_distribution(dog_dataset)
+----------------------------------------
+Cell 11:
+
+# Split full dataset into train / val / test 
+full_dataset = dog_dataset
+
+val_fraction  = 0.15
+test_fraction = 0.15
+batch_size    = 64
+
+total_size = len(full_dataset)
+val_size   = int(total_size * val_fraction)
+test_size  = int(total_size * test_fraction)
+train_size = total_size - val_size - test_size
+
+train_subset, val_subset, test_subset = random_split(
+    full_dataset, [train_size, val_size, test_size]
+)
+
+# Get mean and std from the train dataset for later use in Normalize()
+# mean, std = helper_utils.get_mean_std(train_subset)
+
+# Hardcoded mean and std to skip recomputation each run
+mean = torch.tensor([0.4760, 0.4521, 0.3909])
+std = torch.tensor([0.2544, 0.2488, 0.2536])
+print(f"Mean: {mean}, Std: {std}\n")
+
+----------------------------------------
+Cell 13:
+# Get transformations
+main_tfs = [  
+    # Resize images to 128x128 pixels
+    transforms.Resize(128),
+    # Centercrop
+    transforms.CenterCrop(128),
+    # Convert images to PyTorch tensors
+    transforms.ToTensor(),
+    # Normalize images using the provided mean and std
+    transforms.Normalize(mean, std)
+]  
+
+augmentation_tfs = [  
+    # Randomly flip the image vertically
+    transforms.RandomHorizontalFlip(p=0.5),
+    # Randomly rotate the image by ±15 degrees
+    transforms.RandomRotation(degrees=15)
+]  
+
+# Compose the main transformations into a single pipeline
+main_transform = transforms.Compose(main_tfs)
+transform_with_augmentation = transforms.Compose(augmentation_tfs+main_tfs)
+----------------------------------------
+Cell 15:
+# Improve performance on 14-core CPU
+NUM_WORKERS = 10
+PREFETCH   = 4
+
+# Wrap subsets with the correct transforms 
+trainset_with_aug       = SubsetWithTransform(train_subset, transform_with_augmentation)
+trainset                = SubsetWithTransform(train_subset, main_transform)
+validationset           = SubsetWithTransform(val_subset,   main_transform)
+testset                 = SubsetWithTransform(test_subset,  main_transform)
+
+# Create dataloaders 
+trainloader_with_aug      = DataLoader(trainset_with_aug, batch_size=batch_size, shuffle=True, num_workers=NUM_WORKERS, 
+                                       persistent_workers=True, prefetch_factor=PREFETCH)
+trainloader               = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=NUM_WORKERS, 
+                                       persistent_workers=True, prefetch_factor=PREFETCH)
+validationloader          = DataLoader(validationset, batch_size=512, shuffle=False, num_workers=NUM_WORKERS,
+                                        persistent_workers=True, prefetch_factor=PREFETCH)
+testloader                = DataLoader(testset, batch_size=512, shuffle=False, num_workers=NUM_WORKERS,
+                                        persistent_workers=True, prefetch_factor=PREFETCH)
+
+# Quick sanity checks
+print("Train samples:", len(trainset), "  batches:", len(trainloader))
+print("Val   samples:", len(validationset), "  batches:", len(validationloader))
+print("Test  samples:", len(testset), "  batches:", len(testloader))
+----------------------------------------
+Cell 17:
+class BasicCNN(nn.Module):
+    """
+    A baseline CNN for 3×128×128 dog images using conv–ReLU–pool blocks.
+
+    Args:
+        num_classes (int): Number of output classes produced by the classifier.
+    """
+
+    def __init__(self, num_classes: int = 120):
+        """
+        Build the convolutional feature extractor and classifier head.
+
+        Args:
+            num_classes (int): Number of dog breeds to predict.
+
+        Returns:
+            None
+        """
+        super().__init__()
+
+        # Feature extraction blocks capture increasingly abstract patterns.
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.relu = nn.ReLU(inplace=True)
+
+        # For 128×128 input: after 3 pooling layers -> 128 → 64 → 32 → 16.
+        self.flatten_dim = 128 * 16 * 16
+
+        # Classification head converts flattened features to logits.
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(self.flatten_dim, 256)
+        self.fc2 = nn.Linear(256, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run the forward pass through the CNN.
+
+        Args:
+            x (torch.Tensor): Batch of images shaped ``(N, 3, 128, 128)``.
+
+        Returns:
+            torch.Tensor: Logits of shape ``(N, num_classes)``.
+        """
+        x = self.pool(self.relu(self.conv1(x)))
+        x = self.pool(self.relu(self.conv2(x)))
+        x = self.pool(self.relu(self.conv3(x)))
+        x = self.flatten(x)
+        x = self.relu(self.fc1(x))
+        return self.fc2(x)
+
+
+----------------------------------------
+Cell 19:
+
+def _amp_autocast(device):
+    if device.type in ("mps", "cuda"):
+        dtype = torch.bfloat16 if device.type == "mps" else torch.float16
+        return torch.autocast(device_type=device.type, dtype=dtype)
+    return nullcontext()
+
+
+def train_epoch(model, dataloader, optimizer, loss_fcn, device):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    samples = 0
+
+    for inputs, targets in dataloader:
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        with _amp_autocast(device):
+            outputs = model(inputs)
+            loss = loss_fcn(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        predictions = outputs.argmax(dim=1)
+        correct += (predictions == targets).sum().item()
+        samples += targets.size(0)
+
+    avg_loss = running_loss / max(samples, 1)
+    accuracy = correct / max(samples, 1)
+    return avg_loss, accuracy
+
+
+def validate_epoch(model, dataloader, loss_fcn, device):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    samples = 0
+
+    with torch.no_grad():
+        for inputs, targets in dataloader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            with _amp_autocast(device):
+                outputs = model(inputs)
+                loss = loss_fcn(outputs, targets)
+            running_loss += loss.item() * inputs.size(0)
+
+            predictions = outputs.argmax(dim=1)
+            correct += (predictions == targets).sum().item()
+            samples += targets.size(0)
+
+    avg_loss = running_loss / max(samples, 1)
+    accuracy = correct / max(samples, 1)
+    return avg_loss, accuracy
+
+
+def train_model(
+    model,
+    optimizer,
+    train_dataloader,
+    n_epochs,
+    loss_fcn,
+    device,
+    val_dataloader=None,
+    writer=None,
+    lr_scheduler=None,
+):
+    history = []
+    for epoch in range(1, n_epochs + 1):
+        start = time.perf_counter()
+        train_loss, train_acc = train_epoch(
+            model=model,
+            dataloader=train_dataloader,
+            optimizer=optimizer,
+            loss_fcn=loss_fcn,
+            device=device,
+        )
+
+        metrics = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_accuracy": train_acc,
+        }
+
+        if val_dataloader is not None:
+            val_loss, val_acc = validate_epoch(
+                model=model,
+                dataloader=val_dataloader,
+                loss_fcn=loss_fcn,
+                device=device,
+            )
+            metrics["val_loss"] = val_loss
+            metrics["val_accuracy"] = val_acc
+            
+        duration = time.perf_counter() - start
+        metrics["epoch_time_sec"] = duration
+        history.append(metrics)
+
+        if writer is not None:
+            if val_dataloader is not None:
+                writer.add_scalars(
+                    "Loss",
+                    {"train": train_loss, "val": metrics["val_loss"]},
+                    epoch,
+                )
+                writer.add_scalars(
+                    "Accuracy",
+                    {"train": train_acc, "val": metrics["val_accuracy"]},
+                    epoch,
+                )
+            else:
+                writer.add_scalar("Loss/train", train_loss, epoch)
+                writer.add_scalar("Accuracy/train", train_acc, epoch)
+
+            writer.add_scalar("Timing/epoch_seconds", duration, epoch)
+
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+    return history
+----------------------------------------
+Cell 21:
+# Overfitting test on a single batch to validate the training loop
+overfit_epochs = 100
+# Grab a deterministic batch so each epoch (and rerun) sees the very same data.
+trainloader_overfit = DataLoader(trainset, batch_size=batch_size, shuffle=False, num_workers=NUM_WORKERS, persistent_workers=True, prefetch_factor=PREFETCH)
+batch_inputs, batch_targets = next(iter(trainloader_overfit))
+single_dataset = TensorDataset(batch_inputs.clone(), batch_targets.clone())
+single_loader = DataLoader(single_dataset, batch_size=batch_inputs.size(0))
+
+overfit_model = BasicCNN().to(device)
+overfit_optimizer = optim.SGD(overfit_model.parameters(), lr=0.01)
+loss_fcn = nn.CrossEntropyLoss()
+
+writer = SummaryWriter(log_dir="runs/overfit")
+
+overfit_history = train_model(
+    model=overfit_model,
+    optimizer=overfit_optimizer,
+    train_dataloader=single_loader,
+    n_epochs=overfit_epochs,
+    loss_fcn=loss_fcn,
+    device=device,
+    val_dataloader=single_loader,
+    writer=writer,
+)
+final_overfit = overfit_history[-1]
+writer.close()
+
+print(
+    f"Overfit run final accuracy: {final_overfit['train_accuracy']:.3%} "
+    f"(val {final_overfit['val_accuracy']:.3%})"
+)
+
+
+----------------------------------------
+Cell 22:
+helper_utils.plot_learning_curves("overfit")     # uses logs from "runs/overfit"
+----------------------------------------
+Cell 25:
+# Train the baseline model on the full training set with plain SGD
+baseline_epochs = 10
+baseline_model = BasicCNN().to(device)
+baseline_optimizer = optim.SGD(baseline_model.parameters(), lr=0.01)
+loss_fcn = nn.CrossEntropyLoss()
+baseline_writer = SummaryWriter(log_dir="runs/baseline")
+
+baseline_history = train_model(
+    model=baseline_model,
+    optimizer=baseline_optimizer,
+    train_dataloader=trainloader,
+    n_epochs=baseline_epochs,
+    loss_fcn=loss_fcn,
+    device=device,
+    val_dataloader=validationloader,
+    writer=baseline_writer,
+)
+
+baseline_writer.close()
+
+final_baseline = baseline_history[-1]
+print(
+    "Baseline training finished:",
+    f" train acc {final_baseline['train_accuracy']:.3%},",
+    f" val acc {final_baseline['val_accuracy']:.3%},",
+)
+
+
+----------------------------------------
+Cell 26:
+helper_utils.plot_learning_curves("baseline")
+----------------------------------------
+Cell 29:
+
+os.makedirs(os.path.join("runs", "grid"), exist_ok=True)
+
+grid_learning_rates = [0.003, 0.01, 0.03]
+grid_batch_sizes = [32, 64]
+grid_epochs = 20
+loss_fcn = nn.CrossEntropyLoss()
+
+grid_runs = []
+grid_summary_rows = []
+
+for lr, bs in product(grid_learning_rates, grid_batch_sizes):
+    run_label = f"lr={lr:.3g} | bs={bs}"
+    print(f"Training {run_label}")
+
+    model = BasicCNN().to(device)
+    optimizer = optim.SGD(model.parameters(), lr=lr)
+    train_loader_grid = DataLoader(trainset, batch_size=bs, shuffle=True, num_workers=NUM_WORKERS, 
+                                       persistent_workers=True, prefetch_factor=PREFETCH)
+
+    log_dir = os.path.join("runs", "grid", f"lr_{str(lr).replace('.', 'p')}_bs_{bs}")
+    writer = SummaryWriter(log_dir=log_dir)
+
+    history = train_model(
+        model=model,
+        optimizer=optimizer,
+        train_dataloader=train_loader_grid,
+        n_epochs=grid_epochs,
+        loss_fcn=loss_fcn,
+        device=device,
+        val_dataloader=validationloader,
+        writer=writer,
+    )
+    writer.close()
+
+    final_metrics = history[-1]
+    print(
+        f"  final train acc: {final_metrics['train_accuracy']:.3%} | "
+        f"val acc: {final_metrics['val_accuracy']:.3%}"
+    )
+
+    grid_runs.append(
+        {
+            "label": run_label,
+            "learning_rate": lr,
+            "batch_size": bs,
+            "history": history,
+        }
+    )
+    grid_summary_rows.append(
+        {
+            "label": run_label,
+            "learning_rate": lr,
+            "batch_size": bs,
+            "val_accuracy": final_metrics["val_accuracy"],
+            "val_loss": final_metrics["val_loss"],
+            "train_accuracy": final_metrics["train_accuracy"],
+            "train_loss": final_metrics["train_loss"],
+        }
+    )
+
+grid_summary = pd.DataFrame(grid_summary_rows).sort_values(
+    "val_accuracy", ascending=False
+).reset_index(drop=True)
+grid_summary
+----------------------------------------
+Cell 30:
+
+if "grid_runs" not in globals() or not grid_runs:
+    raise RuntimeError("Run the grid search cell above to populate `grid_runs`.")
+
+grid_plot_df = helper_utils.build_grid_frame(grid_runs)
+combo_order = sorted(grid_plot_df["combo"].unique())
+palette = dict(zip(combo_order, sns.color_palette("viridis", len(combo_order))))
+sns.set_theme(style="whitegrid")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for metric, ax, ylabel in [
+    ("loss", axes[0], "Loss"),
+    ("accuracy", axes[1], "Accuracy"),
+]:
+    metric_df = grid_plot_df[grid_plot_df["metric"] == metric]
+    sns.lineplot(
+        data=metric_df,
+        x="epoch",
+        y="value",
+        hue="combo",
+        style="split",
+        hue_order=combo_order,
+        palette=palette,
+        ax=ax,
+    )
+    ax.set_title(f"LR/Batch Grid – {ylabel}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel)
+    ax.legend(title="Run | Split")
+
+plt.tight_layout()
+plt.show()
+----------------------------------------
+Cell 33:
+# Using optimal configuration from LR/Batch grid search:
+# learning_rate = 0.003, batch_size = 64
+
+baseline_epochs = 50
+learning_rate = 0.003
+batch_size = 64
+
+# Recreate dataloaders with the chosen batch size
+trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=NUM_WORKERS, 
+                                       persistent_workers=True, prefetch_factor=PREFETCH)
+
+# Initialize model, optimizer, loss function, and TensorBoard writer
+baseline_model = BasicCNN().to(device)
+baseline_optimizer = optim.SGD(baseline_model.parameters(), lr=learning_rate)
+loss_fcn = nn.CrossEntropyLoss()
+
+baseline_writer = SummaryWriter(log_dir=f"runs/baseline_lr{learning_rate}_bs{batch_size}")
+
+# Train model
+baseline_history = train_model(
+    model=baseline_model,
+    optimizer=baseline_optimizer,
+    train_dataloader=trainloader,
+    n_epochs=baseline_epochs,
+    loss_fcn=loss_fcn,
+    device=device,
+    val_dataloader=validationloader,
+    writer=baseline_writer,
+)
+
+# Log hyperparameters and final metrics
+final_baseline = baseline_history[-1]
+baseline_writer.close()
+
+# Print summary
+print(
+    f"Baseline training finished "
+    f"(SGD | lr={learning_rate} | bs={batch_size} | epochs={baseline_epochs}):\n"
+    f"  Train Accuracy: {final_baseline['train_accuracy']:.3%}\n"
+    f"  Val Accuracy:   {final_baseline['val_accuracy']:.3%}"
+)
+----------------------------------------
+Cell 34:
+helper_utils.plot_learning_curves(f"baseline_lr{learning_rate}_bs{batch_size}")
+----------------------------------------
+Cell 37:
+# 5-Fold Cross-Validation on trainset (statistical error included) 
+n_splits    = 5
+cv_epochs   = 30
+learning_rate = 0.003
+batch_size    = 64
+rng_seed      = 42
+
+kf = KFold(n_splits=n_splits, shuffle=True, random_state=rng_seed)
+
+fold_metrics = []
+print(f"CV: {n_splits} folds × {cv_epochs} epochs | lr={learning_rate}, bs={batch_size}")
+
+for fold, (train_idx, val_idx) in enumerate(kf.split(trainset), 1):
+    print(f"\n--- Fold {fold}/{n_splits} ---")
+    train_subset = torch.utils.data.Subset(trainset, train_idx)
+    val_subset   = torch.utils.data.Subset(trainset, val_idx)
+
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=NUM_WORKERS, 
+                                       persistent_workers=True, prefetch_factor=PREFETCH)
+    val_loader = DataLoader(val_subset, batch_size=512, shuffle=False, num_workers=NUM_WORKERS,
+                                        persistent_workers=True, prefetch_factor=PREFETCH)
+   
+
+    model = BasicCNN().to(device)
+    optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+    loss_fcn = nn.CrossEntropyLoss()
+    writer = SummaryWriter(log_dir=f"runs/cv_fold{fold}")
+
+    history = train_model(
+        model=model,
+        optimizer=optimizer,
+        train_dataloader=train_loader,
+        n_epochs=cv_epochs,
+        loss_fcn=loss_fcn,
+        device=device,
+        val_dataloader=val_loader,
+        writer=writer,
+    )
+    writer.close()
+
+    final = history[-1]
+    fold_metrics.append(final)
+    print(f"Fold {fold}: train acc {final['train_accuracy']:.3%} | val acc {final['val_accuracy']:.3%}")
+
+# Aggregate with statistical error (SEM) and 95% CI
+def agg_stats(values):
+    arr  = np.asarray(values, dtype=float)
+    mean = arr.mean()
+    std  = arr.std(ddof=1)                 # sample std
+    sem  = std / np.sqrt(len(arr))         # standard error of the mean
+    ci95_low  = mean - 1.96 * sem
+    ci95_high = mean + 1.96 * sem
+    return dict(mean=mean, std=std, sem=sem, ci95=(ci95_low, ci95_high))
+
+val_accs    = [m["val_accuracy"] for m in fold_metrics]
+train_accs  = [m["train_accuracy"] for m in fold_metrics]
+val_losses  = [m["val_loss"] for m in fold_metrics]
+train_losses= [m["train_loss"] for m in fold_metrics]
+
+stats = {
+    "Train Accuracy": agg_stats(train_accs),
+    "Val Accuracy":   agg_stats(val_accs),
+    "Train Loss":     agg_stats(train_losses),
+    "Val Loss":       agg_stats(val_losses),
+}
+
+print("\n=== Cross-Validation Summary (mean ± SEM; 95% CI) ===")
+for name, s in stats.items():
+    m, sd, se = s["mean"], s["std"], s["sem"]
+    lo, hi = s["ci95"]
+    # %-style for accuracies, plain for losses
+    if "Accuracy" in name:
+        print(f"{name:15s}: {m:7.3%} ± {se:7.3%}  (std={sd:7.3%}, 95% CI [{lo:7.3%}, {hi:7.3%}])")
+    else:
+        print(f"{name:15s}: {m:8.4f} ± {se:8.4f}  (std={sd:8.4f}, 95% CI [{lo:8.4f}, {hi:8.4f}])")
+----------------------------------------
+Cell 40:
+
+class FlexCNN(nn.Module):
+    """
+    A flexible Convolutional Neural Network with a dynamically created classifier.
+
+    This CNN's architecture is defined by the provided hyperparameters,
+    allowing for a variable number of convolutional layers. The classifier
+    (fully connected layers) is constructed during the first forward pass
+    to adapt to the output size of the convolutional feature extractor.
+    """
+
+    def __init__(
+        self,
+        n_layers,
+        n_filters,
+        kernel_sizes,
+        dropout_rate,
+        fc_size,
+        pool_schedule=None,
+    ):
+        """
+        Initialize the feature extraction portion of the network.
+
+        Args:
+            n_layers (int): Number of convolutional blocks to build.
+            n_filters (list[int]): Output channels for each block.
+            kernel_sizes (list[int]): Kernel sizes for the convolutions.
+            dropout_rate (float): Dropout probability used in the classifier.
+            fc_size (int): Hidden size of the fully connected layer.
+            pool_schedule (list[bool] | None): Optional flags that control
+                whether each block applies a MaxPool layer. Defaults to pooling
+                after every block for backwards compatibility.
+
+        Returns:
+            None
+        """
+        super(FlexCNN, self).__init__()
+
+        if pool_schedule is None:
+            pool_schedule = [True] * n_layers
+        if not (len(n_filters) == len(kernel_sizes) == len(pool_schedule) == n_layers):
+            raise ValueError("n_layers must match the length of n_filters, kernel_sizes, and pool_schedule")
+
+        blocks = []
+        in_channels = 3
+
+        for i in range(n_layers):
+            out_channels = n_filters[i]
+            kernel_size = kernel_sizes[i]
+            padding = (kernel_size - 1) // 2
+            use_pool = pool_schedule[i]
+
+            layers = [
+                nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
+                nn.ReLU(),
+            ]
+            if use_pool:
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+
+            block = nn.Sequential(*layers)
+            blocks.append(block)
+            in_channels = out_channels
+
+        self.features = nn.Sequential(*blocks)
+        self.dropout_rate = dropout_rate
+        self.fc_size = fc_size
+        self.classifier = None
+
+    def _create_classifier(self, flattened_size, device):
+        self.classifier = nn.Sequential(
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(flattened_size, self.fc_size),
+            nn.ReLU(inplace=True),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.fc_size, 120),
+        ).to(device)
+
+    def forward(self, x):
+        device = x.device
+        x = self.features(x)
+        flattened = torch.flatten(x, 1)
+        flattened_size = flattened.size(1)
+        if self.classifier is None:
+            self._create_classifier(flattened_size, device)
+        return self.classifier(flattened)
+
+
+----------------------------------------
+Cell 41:
+# Optional weight inits
+def he_init(m):
+    if isinstance(m, (nn.Conv2d, nn.Linear)):
+        nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+def xavier_init(m):
+    if isinstance(m, (nn.Conv2d, nn.Linear)):
+        nn.init.xavier_normal_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+# BatchNorm variant
+# (Same signature & idea as FlexCNN; only adds BatchNorm2d after each Conv2d)
+class FlexCNN_BN(nn.Module):
+    def __init__(self, n_layers, n_filters, kernel_sizes, dropout_rate, fc_size, pool_schedule=None):
+        super().__init__()
+        if pool_schedule is None:
+            pool_schedule = [True] * n_layers
+        assert len(n_filters) == len(kernel_sizes) == len(pool_schedule) == n_layers, \
+            "n_layers must match lengths of n_filters, kernel_sizes, pool_schedule"
+
+        blocks, in_ch = [], 3
+        for i in range(n_layers):
+            out_ch = n_filters[i]
+            k = kernel_sizes[i]
+            pad = (k - 1) // 2
+            use_pool = pool_schedule[i]
+            layers = [
+                nn.Conv2d(in_ch, out_ch, k, padding=pad),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ]
+            if use_pool:
+                layers.append(nn.MaxPool2d(2, 2))
+            blocks.append(nn.Sequential(*layers))
+            in_ch = out_ch
+
+        self.features = nn.Sequential(*blocks)
+        self.dropout_rate = dropout_rate
+        self.fc_size = fc_size
+        self.classifier = None  # built lazily to match flattened size
+
+    def _create_classifier(self, flat_size, device):
+        self.classifier = nn.Sequential(
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(flat_size, self.fc_size),
+            nn.ReLU(inplace=True),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.fc_size, 120),  # dataset has 120 classes in this notebook
+        ).to(device)
+
+    def forward(self, x):
+        x = self.features(x)
+        flat = torch.flatten(x, 1)
+        if self.classifier is None:
+            self._create_classifier(flat.size(1), x.device)
+        return self.classifier(flat)
+----------------------------------------
+Cell 43:
+# Minimal runner that reuses the notebook's training loop & loaders
+def run_flex_experiment(
+    run_name,
+    n_layers, n_filters, kernel_sizes, pool_schedule,
+    dropout_rate=0.0, fc_size=256,
+    model_class=None,                 # FlexCNN or FlexCNN_BN
+    optimizer_name="SGD",
+    lr=None,
+    epochs=None,
+    dataloader=None,                  # trainloader or trainloader_with_aug
+    val_loader=None,                  # validationloader
+    weight_init=None,                 # he_init, xavier_init, or None
+):
+    """
+    Creates the model, optionally applies weight init, trains with the notebook's train_model,
+    logs to TensorBoard, and plots curves with helper_utils.plot_learning_curves.
+    """
+    # Defaults from the notebook's globals
+    if model_class is None:
+        model_class = FlexCNN  # defined earlier in the notebook
+    if lr is None:
+        lr = learning_rate
+    if epochs is None:
+        epochs = baseline_epochs
+    if dataloader is None:
+        dataloader = trainloader
+    if val_loader is None:
+        val_loader = validationloader
+
+    log_dir = os.path.join("runs", run_name)
+    if os.path.isdir(log_dir):
+        shutil.rmtree(log_dir)
+
+    model = model_class(
+        n_layers=n_layers,
+        n_filters=n_filters,
+        kernel_sizes=kernel_sizes,
+        dropout_rate=dropout_rate,
+        fc_size=fc_size,
+        pool_schedule=pool_schedule,
+    ).to(device)
+
+    # Build classifier head lazily (as in your notebook)
+    _ = model(torch.zeros(1, 3, 128, 128, device=device))
+
+    if weight_init is not None:
+        model.apply(weight_init)
+
+    if optimizer_name.lower() == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+    else:
+        optimizer = optim.SGD(model.parameters(), lr=lr)
+
+    writer = SummaryWriter(log_dir=log_dir)
+    history = train_model(
+        model=model,
+        optimizer=optimizer,
+        train_dataloader=dataloader,
+        n_epochs=epochs,
+        loss_fcn=nn.CrossEntropyLoss(),
+        device=device,
+        val_dataloader=val_loader,
+        writer=writer,
+    )
+    writer.close()
+
+    final = history[-1]
+    print(f"{run_name}: train acc {final['train_accuracy']:.3%} | val acc {final['val_accuracy']:.3%}")
+    helper_utils.plot_learning_curves(run_name)
+    return history
+----------------------------------------
+Cell 46:
+# Keep a growing list of all runs for a final summary
+all_runs = []
+# Import helpers
+from helper_utils import report_best
+----------------------------------------
+Cell 48:
+# H1: Augmentation only (no BN, no dropout), 3 blocks
+name = "exp2/h01_aug_only"
+h1 = run_flex_experiment(
+    name,
+    n_layers=3,
+    n_filters=[32, 64, 128],
+    kernel_sizes=[3, 3, 3],
+    pool_schedule=[True, True, True],
+    dropout_rate=0.0,
+    fc_size=256,
+    dataloader=trainloader_with_aug,
+    lr=learning_rate,
+    epochs=100,
+)
+report_best(name, h1)
+all_runs.append((name, h1))
+----------------------------------------
+Cell 51:
+# H2: +Dropout on top of augmentation (still no BN), 3 blocks
+name = "exp2/h02_aug_dropout"
+h2 = run_flex_experiment(
+    name,
+    n_layers=3,
+    n_filters=[32, 64, 128],
+    kernel_sizes=[3, 3, 3],
+    pool_schedule=[True, True, True],
+    dropout_rate=0.5,
+    fc_size=256,
+    dataloader=trainloader_with_aug,
+    lr=learning_rate,
+    epochs=100,
+)
+report_best(name, h2)
+all_runs.append((name, h2))
+----------------------------------------
+Cell 54:
+# H3: +BatchNorm (stabilized recipe: aug + dropout + BN), 3 blocks
+name = "exp2/h03_aug_dropout_bn"
+h3 = run_flex_experiment(
+    name,
+    n_layers=3,
+    n_filters=[32, 64, 128],
+    kernel_sizes=[3, 3, 3],
+    pool_schedule=[True, True, True],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    lr=0.02,
+    epochs=100,
+)
+report_best(name, h3)
+all_runs.append((name, h3))
+----------------------------------------
+Cell 57:
+# H4: He initialization under stabilized recipe, 3 blocks
+name = "exp2/h04_he_init_bn_aug_do"
+h4 = run_flex_experiment(
+    name,
+    n_layers=3,
+    n_filters=[32, 64, 128],
+    kernel_sizes=[3, 3, 3],
+    pool_schedule=[True, True, True],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    lr=0.02,
+    epochs=100,
+    weight_init=he_init,
+)
+report_best(name, h4)
+all_runs.append((name, h4))
+----------------------------------------
+Cell 60:
+# H5: Depth ↑ to 5 blocks (pool every block → 4×4), stabilized recipe
+name = "exp2/h05_depth5_bn_aug_do"
+h5 = run_flex_experiment(
+    name,
+    n_layers=5,
+    n_filters=[32, 64, 128, 128, 128],
+    kernel_sizes=[3, 3, 3, 3, 3],
+    pool_schedule=[True, True, True, True, True],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    lr=0.02,
+    epochs=100,
+)
+report_best(name, h5)
+all_runs.append((name, h5))
+----------------------------------------
+Cell 63:
+# H6: Too deep: 8 blocks (5 pools → final 4×4), stabilized recipe
+name = "exp2/h06_depth8_bn_aug_do"
+h6 = run_flex_experiment(
+    name,
+    n_layers=8,
+    n_filters=[32, 64, 128, 128, 128, 128, 128, 128],
+    kernel_sizes=[3]*8,
+    pool_schedule=[True, True, True, True, True, False, False, False],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    lr=0.02,
+    epochs=100,
+)
+report_best(name, h6)
+all_runs.append((name, h6))
+----------------------------------------
+Cell 66:
+# H7: Width ↑ moderately to [64,128,256], stabilized recipe (3 blocks)
+name = "exp2/h07_width_moderate_bn_aug_do"
+h7 = run_flex_experiment(
+    name,
+    n_layers=3,
+    n_filters=[64, 128, 256],
+    kernel_sizes=[3, 3, 3],
+    pool_schedule=[True, True, True],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    lr=0.02,
+    epochs=100,
+)
+report_best(name, h7)
+all_runs.append((name, h7))
+----------------------------------------
+Cell 69:
+# H8: Width ↑ large to [128,256,512], stabilized recipe (3 blocks)
+name = "exp2/h08_width_large_bn_aug_do"
+h8 = run_flex_experiment(
+    name,
+    n_layers=3,
+    n_filters=[128, 256, 512],
+    kernel_sizes=[3, 3, 3],
+    pool_schedule=[True, True, True],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    lr=0.02,
+    epochs=100,
+)
+report_best(name, h8)
+all_runs.append((name, h8))
+----------------------------------------
+Cell 72:
+# H9: Kernel size 5×5 (vs 3×3), stabilized recipe (3 blocks)
+name = "exp2/h09_kernel_5x5_bn_aug_do"
+h9 = run_flex_experiment(
+    name,
+    n_layers=3,
+    n_filters=[32, 64, 128],
+    kernel_sizes=[5, 5, 5],
+    pool_schedule=[True, True, True],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    lr=0.02,
+    epochs=100,
+)
+report_best(name, h9)
+all_runs.append((name, h9))
+----------------------------------------
+Cell 75:
+# H10: Pooling schedule — lighter pooling for 5 blocks (→16×16), compare to pool-all (→4×4)
+name = "exp2/h10_depth5_light_pool_bn_aug_do"
+h10 = run_flex_experiment(
+    name,
+    n_layers=5,
+    n_filters=[32, 64, 128, 128, 128],
+    kernel_sizes=[3]*5,
+    pool_schedule=[True, True, True, False, False],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    lr=0.02,
+    epochs=100,
+)
+report_best(name, h10)
+all_runs.append((name, h10))
+----------------------------------------
+Cell 78:
+# H11: Adam vs SGD under stabilized recipe, 3 blocks
+name = "exp2/h11_adam_bn_aug_do"
+h11 = run_flex_experiment(
+    name,
+    n_layers=3,
+    n_filters=[32, 64, 128],
+    kernel_sizes=[3, 3, 3],
+    pool_schedule=[True, True, True],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    optimizer_name="Adam",
+    lr=0.002,
+    epochs=100,
+)
+report_best(name, h11)
+all_runs.append((name, h11))
+----------------------------------------
+Cell 81:
+# H12: Higher LR with BN (0.03 vs 0.02), stabilized recipe, 3 blocks
+name = "exp2/h12_bn_aug_do_lr0p03"
+h12 = run_flex_experiment(
+    name,
+    n_layers=3,
+    n_filters=[32, 64, 128],
+    kernel_sizes=[3, 3, 3],
+    pool_schedule=[True, True, True],
+    dropout_rate=0.5,
+    fc_size=256,
+    model_class=FlexCNN_BN,
+    dataloader=trainloader_with_aug,
+    lr=0.03,
+    epochs=100,
+)
+report_best(name, h12)
+all_runs.append((name, h12))
+----------------------------------------
+Cell 88:
+# ImageNet normalization used by both ResNet and CoAtNet pretrained weights
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+# Unified set of transforms
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomApply([
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
+    ], p=0.8),
+    transforms.RandomRotation(15),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+
+
+# Wrap subsets with the correct transforms 
+trainset_with_aug       = SubsetWithTransform(train_subset, train_transform)
+validationset           = SubsetWithTransform(val_subset,   val_transform)
+testset                 = SubsetWithTransform(test_subset,  val_transform)
+
+# Dataloaders
+trainloader_with_aug = DataLoader(
+    trainset_with_aug,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    persistent_workers=True,
+    prefetch_factor=PREFETCH
+)
+
+validationloader = DataLoader(
+    validationset,
+    batch_size=512,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    persistent_workers=True,
+    prefetch_factor=PREFETCH
+)
+
+testloader = DataLoader(
+    testset,
+    batch_size=512,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    persistent_workers=True,
+    prefetch_factor=PREFETCH
+)
+----------------------------------------
+Cell 90:
+# Transfer learning with ResNet18 (pretrained)
+from torchvision import models
+
+def run_resnet18_experiment(run_name, pretrained=True, freeze_backbone=False, optimizer_name="SGD", lr=None, epochs=None, dataloader=None, val_loader=None):
+    if lr is None: lr = 3e-3
+    if epochs is None: epochs = 50
+    if dataloader is None: dataloader = trainloader_with_aug
+    if val_loader is None: val_loader = validationloader
+
+    log_dir = os.path.join("runs", run_name)
+    if os.path.isdir(log_dir):
+        shutil.rmtree(log_dir)
+
+    weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+    model = models.resnet18(weights=weights)
+    model.fc = nn.Sequential(
+    nn.Dropout(p=0.4),            
+    nn.Linear(model.fc.in_features, 120),
+)
+    model = model.to(device)
+
+    if freeze_backbone:
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.fc.parameters():
+            p.requires_grad = True
+        params = model.fc.parameters()
+    else:
+        params = model.parameters()
+
+    if optimizer_name.lower() == "adam":
+        optimizer = optim.AdamW(params, lr=(lr/10), weight_decay=3e-5)
+    else:
+        optimizer = optim.SGD(
+            params,
+            lr=lr,
+            momentum=0.9,
+            weight_decay=3e-4,
+        )
+
+    loss_fcn = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    writer = SummaryWriter(log_dir=log_dir)
+    history = train_model(
+        model=model,
+        optimizer=optimizer,
+        train_dataloader=dataloader,
+        n_epochs=epochs,
+        loss_fcn=loss_fcn,
+        device=device,
+        val_dataloader=val_loader,
+        writer=writer,
+    )
+    writer.close()
+    final = history[-1]
+    print(f"{run_name}: train acc {final['train_accuracy']:.3%} | val acc {final['val_accuracy']:.3%}")
+    helper_utils.plot_learning_curves(run_name)
+    return history
+----------------------------------------
+Cell 92:
+# H13: Pretrained, full fine-tune
+name = "exp2/h13_transfer_resnet18_pre_sgd"
+h13 = run_resnet18_experiment(name, pretrained=True, freeze_backbone=False)
+report_best(name, h13)
+all_runs.append((name, h13))
+----------------------------------------
+Cell 95:
+# H14: Pretrained, full fine-tune adam
+name = "exp2/h14_transfer_resnet18_pre_adam"
+h14 = run_resnet18_experiment(name, optimizer_name="adam", pretrained=True, freeze_backbone=False)
+report_best(name, h14)
+all_runs.append((name, h14))
+----------------------------------------
+Cell 98:
+# H15: Pretrained, SGD, freeze backbone
+name = "exp2/h15_transfer_resnet18_pre_sgd_frozen"
+h15 = run_resnet18_experiment(name, pretrained=True, freeze_backbone=True)
+report_best(name, h15)
+all_runs.append((name, h15))
+----------------------------------------
+Cell 101:
+# H16: CoAtNet, pretrained, full fine-tune, Adam, reasonable LR/epochs
+import timm
+
+def run_coatnet_experiment(
+    run_name,
+    model_name="coatnet_0_rw_224.sw_in1k",  # small-ish, good starting point
+    pretrained=True,
+    freeze_backbone=False,
+    optimizer_name="adam",
+    lr=None,
+    epochs=None,
+    dataloader=None,
+    val_loader=None,
+):
+    if lr is None:
+        lr = 5e-4          # smaller LR than ResNet, good for pretrained ViT-style models
+    if epochs is None:
+        epochs = 50        # CoAtNet is heavier; 50 is a reasonable starting point
+    if dataloader is None:
+        dataloader = trainloader_with_aug
+    if val_loader is None:
+        val_loader = validationloader
+
+    log_dir = os.path.join("runs", run_name)
+    if os.path.isdir(log_dir):
+        shutil.rmtree(log_dir)
+
+    # create coatnet with correct number of classes directly
+    model = timm.create_model(
+        model_name,
+        pretrained=pretrained,
+        num_classes=120,
+        drop_rate=0.4,   
+    )
+    model = model.to(device)
+
+    if freeze_backbone:
+        # freeze everything except the classifier head
+        for name, p in model.named_parameters():
+            p.requires_grad = False
+        # timm models use `head` as classifier for coatnet
+        for p in model.get_classifier().parameters():
+            p.requires_grad = True
+        params = model.get_classifier().parameters()
+    else:
+        params = model.parameters()
+
+    if optimizer_name.lower() == "adam":
+        optimizer = optim.AdamW(params, lr=(lr/5), weight_decay=3e-5)
+ 
+    else:
+        optimizer = optim.SGD(params, lr=lr, momentum=0.9, weight_decay=5e-4)
+
+    loss_fcn = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    writer = SummaryWriter(log_dir=log_dir)
+    history = train_model(
+        model=model,
+        optimizer=optimizer,
+        train_dataloader=dataloader,
+        n_epochs=epochs,
+        loss_fcn=loss_fcn,
+        device=device,
+        val_dataloader=val_loader,
+        writer=writer,
+    )
+    writer.close()
+    final = history[-1]
+    print(f"{run_name}: train acc {final['train_accuracy']:.3%} | val acc {final['val_accuracy']:.3%}")
+    helper_utils.plot_learning_curves(run_name)
+    return history
+
+# H16: CoAtNet, pretrained, full fine-tune, Adam, reasonable LR/epochs
+name = "exp2/h16_transfer_coatnet0_pre_adam_freeze"
+h16 = run_coatnet_experiment(
+    name,
+    optimizer_name="adam",
+    lr=3e-4,
+    pretrained=True,
+    freeze_backbone=True,   # full fine-tune
+    epochs=50,
+)
+report_best(name, h16)
+all_runs.append((name, h16))
+----------------------------------------
+Cell 106:
+#  Build Train+Val loader 
+from torch.utils.data import ConcatDataset
+
+trainval_set = ConcatDataset([
+    SubsetWithTransform(train_subset, train_transform),
+    SubsetWithTransform(val_subset,   train_transform),
+])
+trainval_loader = DataLoader(
+    trainval_set,
+    batch_size=64,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    persistent_workers=True,
+    prefetch_factor=PREFETCH,
+)
+
+#  Final CoAtNet fine-tune 
+def run_coatnet_final(
+    run_name="exp2/final_coatnet0",
+    warmup_epochs=5,
+    total_epochs=40,
+    head_lr=1e-4,
+    backbone_lr=2e-5,
+):
+    log_dir = os.path.join("runs", run_name)
+    if os.path.isdir(log_dir):
+        shutil.rmtree(log_dir)
+
+    model = timm.create_model(
+        "coatnet_0_rw_224.sw_in1k",
+        pretrained=True,
+        num_classes=120,
+        drop_rate=0.4,
+    ).to(device)
+
+    loss_fcn = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    writer = SummaryWriter(log_dir=log_dir)
+    history = []
+
+    # 1) Warm-up: freeze backbone, train head only
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.get_classifier().parameters():
+        p.requires_grad = True
+
+    optimizer = optim.AdamW(
+        model.get_classifier().parameters(),
+        lr=head_lr,
+        weight_decay=3e-5,
+    )
+    warmup_hist = train_model(
+        model=model,
+        optimizer=optimizer,
+        train_dataloader=trainval_loader,
+        n_epochs=warmup_epochs,
+        loss_fcn=loss_fcn,
+        device=device,
+        val_dataloader=None,
+        writer=writer,
+    )
+    history.extend(warmup_hist)
+
+    # 2) Unfreeze: discriminative LRs + Cosine schedule
+    for p in model.parameters():
+        p.requires_grad = True
+
+    optimizer = optim.AdamW(
+        [
+            {"params": model.get_classifier().parameters(), "lr": head_lr},
+            {"params": (p for name, p in model.named_parameters() if "head" not in name), "lr": backbone_lr},
+        ],
+        weight_decay=3e-5,
+    )
+    cosine_epochs = total_epochs - warmup_epochs
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+
+    finetune_hist = train_model(
+        model=model,
+        optimizer=optimizer,
+        train_dataloader=trainval_loader,
+        n_epochs=cosine_epochs,
+        loss_fcn=loss_fcn,
+        device=device,
+        val_dataloader=None,
+        writer=writer,
+        lr_scheduler=scheduler,
+    )
+    history.extend(finetune_hist)
+    writer.close()
+
+    # 3) Final evaluation on the untouched test set
+    test_loss, test_acc = validate_epoch(
+        model=model,
+        dataloader=testloader,
+        loss_fcn=loss_fcn,
+        device=device,
+    )
+    print(f"[FINAL] test_acc={test_acc:.3%} | test_loss={test_loss:.4f}")
+
+    helper_utils.plot_learning_curves(run_name)
+    return history, model
+
+final_history, final_model = run_coatnet_final()
+----------------------------------------
+Cell 109:
+#  Persist the trained model
+def save_checkpoint(model, path="models/final_coatnet0.pt"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "class_to_idx": trainset.dataset.class_to_idx if hasattr(trainset, "dataset") else None,
+            "config": {
+                "model_name": "coatnet_0_rw_224.sw_in1k",
+                "img_size": 224,
+                "num_classes": 120,
+            },
+        },
+        path,
+    )
+    print(f"Checkpoint saved to {path}")
+
+# save coatnet_0_rw_224.sw_in1k
+save_checkpoint(final_model)
+----------------------------------------
+Cell 110:
+# save index for later use
+dataset = DogDataset()  # uses data/raw/Images by default
+os.makedirs("models", exist_ok=True)
+with open("models/class_to_idx.json", "w") as fp:
+    json.dump(dataset.class_to_idx, fp, indent=2)
+print("Saved", len(dataset.class_to_idx), "classes")
+
+----------------------------------------
+Cell 112:
+#  Inspect misclassified examples
+def collect_misclassified(model, dataloader, max_items=16):
+    model.eval()
+    mistakes = []
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images = images.to(device)
+            labels = labels.to(device)
+            logits = model(images)
+            probs = torch.softmax(logits, dim=1)
+            conf, preds = probs.max(dim=1)
+            wrong = preds != labels
+            for img, pred, true, p in zip(images[wrong], preds[wrong], labels[wrong], conf[wrong]):
+                mistakes.append((img.cpu(), pred.item(), true.item(), p.item()))
+            if len(mistakes) >= max_items:
+                break
+    return mistakes[:max_items]
+
+
+def prettify(label):
+    raw = label.split("-", 1)[-1]  # drop WordNet prefix if present
+    return raw.replace("_", " ").title()
+
+
+def show_misclassified(mistakes, classes, n_cols=4):
+    inv_normalize = transforms.Normalize(
+        mean= [-m/s for m, s in zip(mean, std)],
+        std=[1/s for s in std],
+    )
+    n_rows = math.ceil(len(mistakes) / n_cols)
+    plt.figure(figsize=(3*n_cols, 3*n_rows))
+    for idx, (img, pred, true, conf) in enumerate(mistakes):
+        plt.subplot(n_rows, n_cols, idx + 1)
+        viz = inv_normalize(img).clamp(0, 1).permute(1, 2, 0).numpy()
+        plt.imshow(viz)
+        plt.axis("off")
+        plt.title(f"pred: {classes[pred]}\ntrue: {classes[true]}\nconf: {conf:.2f}")
+    plt.tight_layout()
+
+# usage on validation or test loader:
+mistakes = collect_misclassified(model, testloader, max_items=16)
+base_ds = trainset_with_aug.subset.dataset
+raw_names = getattr(base_ds, "classes", base_ds.class_names)
+class_names = [prettify(name) for name in raw_names]
+
+mistakes = collect_misclassified(model, testloader, max_items=16)
+show_misclassified(mistakes, class_names)
+----------------------------------------
+Cell 115:
+# load saved model
+import torch
+import timm
+from torchvision import transforms
+from PIL import Image
+
+ckpt = torch.load("models/final_coatnet0.pt", map_location="cpu")
+
+cfg = ckpt["config"]
+model = timm.create_model(
+    cfg["model_name"],  # coatnet_0_rw_224.sw_in1k
+    pretrained=False,
+    num_classes=cfg["num_classes"],  # 120
+)
+model.load_state_dict(ckpt["state_dict"])
+model.eval()
+
+with open("models/class_to_idx.json") as fp:
+    class_to_idx = json.load(fp)
+idx_to_class = {idx: cls for cls, idx in class_to_idx.items()}
+
+mean = [0.485, 0.456, 0.406]  # same values used during training (see augmentation cell)
+std = [0.229, 0.224, 0.225]
+inference_tfms = transforms.Compose([
+    transforms.Resize(cfg["img_size"]),
+    transforms.CenterCrop(cfg["img_size"]),
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),
+])
+----------------------------------------
+Cell 116:
+# classify own image
+img = Image.open("pics/brick.png").resize((224, 224)).convert("RGB")  # drop alpha channel
+img
+----------------------------------------
+Cell 118:
+with torch.no_grad():
+    logits = model(inference_tfms(img).unsqueeze(0))
+    probs = torch.softmax(logits, dim=1)
+    conf, pred_idx = probs.max(dim=1)
+    # print(idx_to_class[pred_idx.item()], conf.item())
+raw_name = idx_to_class[pred_idx.item()]    # e.g. "n02085936-Maltese_dog"
+pretty = raw_name.split("-", 1)[-1].replace("_", " ")
+print(pretty.title())
+----------------------------------------
