@@ -67,3 +67,5 @@ Thumbs.db
 .DS_Store
 
 models/
+/.quarto/
+**/*.quarto_ipynb
