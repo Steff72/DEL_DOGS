@@ -95,12 +95,3 @@ That script:
 1. Restores the exact model architecture defined in the notebook (`coatnet_0_rw_224.sw_in1k`).
 2. Reapplies the ImageNet normalization and 224×224 resolution expected by the pretrained backbone.
 3. Returns the top‑K classes together with confidence scores, formatted with readable breed names.
-
-Feel free to turn this into a CLI or web service—just keep the transform pipeline identical to the training run so inference matches the evaluation environment.
-
-## Tips for extending the project
-- Re‑run `run_coatnet_final` with more epochs or a slightly higher `drop_rate` to probe regularisation strength.
-- Try unfreezing only the later CoAtNet blocks for a compromise between runtime and accuracy.
-- Augment the dataset with external dog images and reuse the same preprocessing to see how far in‑the‑wild generalisation can be pushed.
-
-Good luck, and have fun classifying pups! 🐶
